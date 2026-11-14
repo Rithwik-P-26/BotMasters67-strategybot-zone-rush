@@ -1,6 +1,20 @@
 """
 StrategyBot - Zone Rush bot (team build).
 
+ROUND 2 FINAL WITH FAST GRAB (bot_final_fg.py) = bot_final.py with fg_adapt ON.
+Faster opening (turns 1-12): about +0.13 to +0.16 place against strong
+point-per-turn rivals (ving940) and passive fields, neutral in our mixed
+pool, but about -0.12 to -0.17 if the field has leader-hunting raiders.
+
+bot_final.py = bot_r2.py plus switches (details in PARAMS):
+  - resume_est ON: restart-safe start (server Q13/Q17). A bot restarted
+    mid-game estimates the turn from board progress and the token rotation.
+    Normal games are unchanged (twin check vs bot_r2: 0 differing games).
+  - fg_adapt OFF: adaptive fast grab (fast-grab hazard for the first 12 turns
+    or until the first raid). bot_final_fg.py is this file with it ON.
+  - mp_auto OFF, lam1_mine OFF: tested, not accepted.
+Numbers: runs/team_bot_log.md, section "Round 2 final bot".
+
 Single file, Python standard library only.  Entry point: act(state).
 
 Team build = bot_dev plus:
@@ -124,6 +138,52 @@ PARAMS = {
     "h_prior_n": 4.0,           # prior strength of the learned scale, in expected raids
     "h1_mult": 1.0,
     "h2_mult": 1.0,
+    # --- Round 2: robot time penalties (rulebook 4.4) ------------------------
+    # A bot that moved and is newly frozen did not shield. Blame its freeze on a
+    # shield only if the owner of its new cell could have caught it (it did not
+    # move and was not frozen; on our land: we shielded). Otherwise it is a
+    # 3-turn time penalty: no shield inferred, no reaction stats, frozen 3 turns.
+    # Never happens without penalties, so Round 1 play is unchanged.
+    "pen_blame": True,
+    # Round 2 preset knob: expected extra turns lost per executed move (time
+    # penalties: about 3 x the per-move fault rate). Each planned move then costs
+    # 1 + move_pen turns, so the planner prefers fewer, shorter trips. 0 = off.
+    "move_pen": 0.0,
+    # --- Round 2 final: restart-safe start (server Q13 / Q17) -----------------
+    # A bot restarted mid-game loses its globals. If the first board we see is
+    # not a start board, estimate the turn from board progress (owned non-home
+    # cells and upgrades, fitted on 400 sim games), shift it onto the token
+    # turn (seat s holds the token on turns t with (t - 1) % 4 + 1 == s) the
+    # first time we hold the token, and seed scores from income. A normal game
+    # always starts on a start board, so normal play is unchanged.
+    "resume_est": True,
+    "resume_w": (5.3537, -0.3999, 2.0105, 2.7367, -0.3132, -0.4856, -1.5988, -0.348),
+    "resume_bias": 6.0,         # turns subtracted from the estimate (it overshoots mid-game; 6 > 2 in restart tests)
+    "resume_score_f": 0.6,      # score so far ~ income x turn x this
+    "resume_tok": True,         # align the turn to the token rotation
+    "resume_min_cells": 4,      # fewer owned non-home cells: too early to matter, keep turn 1
+    # --- Round 2 final: adaptive fast grab ------------------------------------
+    # Use the fast-grab hazard (phase profile, L1 x fg_h1_mult) while the field
+    # looks passive; switch it off for good once fg_off_raids raids (on anyone)
+    # or fg_off_intr intrusion stays have been seen, or after turn fg_off_turn.
+    "fg_adapt": True,           # bot_final_fg.py (bot_final.py: False)
+    "fg_h1_mult": 1.5,
+    "fg_off_raids": 1,
+    "fg_off_intr": 0,           # 0 = do not use intrusions
+    "fg_off_turn": 12,          # fga9: the whole gain vs strong rivals comes from turns 1-12
+    # --- Round 2 final: adaptive move cost ------------------------------------
+    # Once we have made mp_auto_n moves, estimate our own per-move penalty rate
+    # (pens + 0.5) / (moves + 5); at or above mp_auto_p use move_pen mp_auto_val.
+    "mp_auto": False,
+    "mp_auto_n": 8,
+    "mp_auto_p": 0.2,
+    "mp_auto_val": 0.3,
+    # --- Round 2 final: our own L1 raid hazard --------------------------------
+    # A leader-hunter raids OUR cells far more than the field average. Learn the
+    # L1 raid rate on our own cells (prior lam1_prior, lam1_mine_n cell-turns)
+    # and use it when it is higher than the field-wide rate.
+    "lam1_mine": False,
+    "lam1_mine_n": 100.0,
 }
 PARAMS_OVERRIDE = {}
 P = dict(PARAMS)
@@ -248,6 +308,12 @@ class Memory(object):
         self.backoff = {}                        # (owner, cell) -> turn we were caught there
         self.blamed = {}                         # frozen bot -> (shielder, its previous last_shield)
         self.inferred = []                       # debug: shields inferred last update
+        self.pen_until = {}                      # bot -> last turn of its time-penalty freeze
+        self.resumed = False                     # memory rebuilt mid-game (turn estimated)
+        self.fg_dead = False                     # adaptive fast grab switched off for good
+        self.intr = 0                            # rival stays on another player's non-home cell
+        self.my_moves = 0                        # our executed moves
+        self.my_pens = 0                         # our time penalties seen
 
 
 def _manh(n, a, b):
@@ -360,7 +426,15 @@ def _update(mem, prev, cur):
     bots = [b for b in cur.bots if b in prev.pos]
     moved = dict((b, prev.pos[b] != cur.pos[b]) for b in bots)
     was_frz = dict((b, prev.frozen(b)) for b in bots)
+    if moved.get(me):
+        mem.my_moves += 1
+    for b in bots:
+        if not moved[b] and not was_frz[b]:
+            x = cur.pos[b]
+            if prev.own[x] and prev.own[x] != b and not prev.home[x]:
+                mem.intr += 1
     newly = {}
+    penal = set()
     for b in bots:
         if cur.frozen(b):
             if was_frz[b] and mem.frz_run[b] < 2:
@@ -386,6 +460,14 @@ def _update(mem, prev, cur):
             continue
         x = cur.pos[b]
         o = prev.own[x]
+        if P["pen_blame"] and moved[b] and not (
+                o and o != b and not moved.get(o, True) and not was_frz.get(o, True)
+                and (o != me or i_shielded)):
+            penal.add(b)                          # time penalty (rulebook 4.4), not a shield
+            mem.pen_until[b] = t + 3
+            if b == me:
+                mem.my_pens += 1
+            continue
         if o == me and b != me and not i_shielded:
             # only the owner catches on its own land (rulebook 2.6) and we did
             # not shield, so b's own shield backfired on our cell
@@ -562,12 +644,62 @@ def _q_stay(mem, r):
     return (st["rv_stay"] + P["q_prior"] * n0) / (st["rv_opp"] + n0)
 
 
+def _fg_active(mem, t):
+    """Adaptive fast grab: on while the field looks passive, off for good after."""
+    if mem.fg_dead:
+        return False
+    if (mem.raids[1] + mem.raids[2] >= P["fg_off_raids"] or t > P["fg_off_turn"]
+            or (P["fg_off_intr"] and mem.intr >= P["fg_off_intr"])):
+        mem.fg_dead = True
+        return False
+    return True
+
+
+def _resume_seed(mem, snap):
+    """Memory rebuilt mid-game: estimate the turn and the scores from the board."""
+    own = upg = 0
+    inc = {}
+    for i in range(snap.size):
+        o = snap.own[i]
+        if o:
+            inc[o] = inc.get(o, 0) + snap.val[i] * snap.lvl[i]
+            if not snap.home[i]:
+                own += 1
+                if snap.lvl[i] == 2:
+                    upg += 1
+    if own < P["resume_min_cells"]:
+        return
+    x = (1.0, own, upg, own * own / 64.0, upg * upg / 32.0, own * upg / 64.0,
+         own ** 3 / 4096.0, upg ** 3 / 1024.0)
+    t = sum(a * b for a, b in zip(P["resume_w"], x)) - P["resume_bias"]
+    t = int(round(min(76.0, max(2.0, t))))
+    mem.turn = t - 1                             # _choose adds 1
+    mem.resumed = True
+    for b, v in inc.items():
+        mem.scores[b] = float(v) * t * P["resume_score_f"]
+
+
+def _resume_align(mem, me):
+    """First token turn after a resume: move the turn estimate onto the token rotation."""
+    t = mem.turn
+    for d in (0, -1, 1, -2, 2):
+        u = t + d
+        if ((u - 1) % 4) + 1 == me:
+            mem.turn = min(TOTAL_TURNS - 1, max(2, u))
+            mem.tok_k = {0, 1, 2, 3}
+            return
+
+
 def _build_ctx(mem, snap):
     c = Ctx()
     c.mem, c.s = mem, snap
     c.t = mem.turn
     c.R = max(1, TOTAL_TURNS - c.t + 1)
     c.me = mem.me
+    c.move_pen = P["move_pen"]
+    if P["mp_auto"] and mem.my_moves >= P["mp_auto_n"]:
+        if (mem.my_pens + 0.5) / (mem.my_moves + 5.0) >= P["mp_auto_p"]:
+            c.move_pen = P["mp_auto_val"]
     c.rivals = [b for b in snap.bots if b != c.me]
     c.mypos = snap.pos[c.me]
     size = snap.size
@@ -578,6 +710,8 @@ def _build_ctx(mem, snap):
         if snap.frozen(b):
             run = max(1, mem.frz_run.get(b, 1))
             c.frozen_until[b] = c.t + max(0, 2 - run)
+            if mem.pen_until.get(b, -1) >= c.t:
+                c.frozen_until[b] = mem.pen_until[b]
         else:
             c.frozen_until[b] = c.t - 1
 
@@ -626,6 +760,9 @@ def _build_ctx(mem, snap):
     n0 = P["lam_prior_n"]
     c.lam1 = (mem.raids[1] + P["lam1_prior"] * n0) / (mem.cellturns[1] + n0)
     c.lam2 = (mem.raids[2] + P["lam2_prior"] * n0) / (mem.cellturns[2] + n0)
+    if P["lam1_mine"]:
+        nm = P["lam1_mine_n"]
+        c.lam1 = max(c.lam1, (mem.my_raids[1] + P["lam1_prior"] * nm) / (mem.my_cellturns[1] + nm))
     fz_haz = mem.fz_prog and P["fz_hazard"]
     lam2_prior = P["lam2_prior_fz"] if fz_haz else P["lam2_prior"]
     c.lam2_mine = (mem.my_raids[2] + lam2_prior * n0) / (mem.my_cellturns[2] + n0)
@@ -633,10 +770,11 @@ def _build_ctx(mem, snap):
         c.lam2 = max(c.lam2, c.lam2_mine)
     c.w_avg = 1.0 / nr
     # F2: phase-dependent hazard (profile x learned per-game scale)
-    c.phase = P["hazard_mode"] == 1
+    fg = P["fg_adapt"] and _fg_active(mem, c.t)
+    c.phase = P["hazard_mode"] == 1 or fg
     if c.phase:
         hn = P["h_prior_n"]
-        s1 = (mem.raids[1] + hn) / (mem.exp_raids[1] + hn) * P["h1_mult"]
+        s1 = (mem.raids[1] + hn) / (mem.exp_raids[1] + hn) * (P["fg_h1_mult"] if fg else P["h1_mult"])
         s2 = (mem.raids[2] + hn) / (mem.exp_raids[2] + hn) * P["h2_mult"]
         s2m = (mem.my_raids[2] + hn) / (mem.my_exp_raids[2] + hn) * P["h2_mult"]
         c.lt1, c.se1 = _life_table(1, s1)
@@ -808,6 +946,8 @@ def _evaluate(c, x, kind, d, prog, start_turn, own, lvl, timed=True):
     o = own[x]
     stays = max(1, _stays_needed(kind) - prog)
     k = d + stays
+    if c.move_pen:
+        k = k + c.move_pen * d
     R = TOTAL_TURNS - start_turn + 1
     if k > R:
         return None
@@ -1078,10 +1218,18 @@ def _choose(state, t0):
     snap = Snap(state)
     if _is_new_game(_MEM, snap):
         _MEM = Memory(snap)
+        if P["resume_est"] and not _is_start(snap):
+            try:
+                _resume_seed(_MEM, snap)
+            except Exception:
+                _log_exc()
     mem = _MEM
     mem.turn += 1
     try:
         mem.turn = min(TOTAL_TURNS, mem.turn + _skipped_turns(mem, snap))
+        if mem.resumed and snap.token and P["resume_tok"]:
+            _resume_align(mem, snap.me)
+            mem.resumed = False
     except Exception:
         _log_exc()
     try:
